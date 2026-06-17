@@ -1,0 +1,7 @@
+# pinned versions added after first run confirms compatibility
+numpy
+opencv-python
+scipy
+matplotlib
+mediapipe
+mujoco
