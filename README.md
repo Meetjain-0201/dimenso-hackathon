@@ -33,6 +33,13 @@ pip install -r requirements.txt          # numpy, opencv, scipy, matplotlib, med
 
 ### Offline motion-translation engine (egocentric video + IMU → G1+Inspire replay)
 
+**Requires a recording present locally.** `data/` is **gitignored** (video/IMU are
+not committed), so a recording must exist at
+`data/task_04_pasteur_pipette/<rec>/{base.mp4, imu.json}` before running. The
+G1+Inspire model and its meshes (`sim/assets/`) **are** committed, so no model setup
+is needed. Verified end-to-end with the `isaac_sim` Python (mediapipe 0.10.21,
+mujoco 3.9.0); `requirements.txt` lists the same deps for a fresh venv.
+
 Render uses `MUJOCO_GL=glfw` (osmesa/egl fail on this box — see docs/diagnostics.md).
 
 ```bash
@@ -55,4 +62,5 @@ MUJOCO_GL=glfw python sim/replay_g1.py --dataset outputs/task04_dataset.npz \
 ```
 
 Individual stages are runnable too (`python -m data_pipeline.pose_extract <rec>`, etc.).
-Sanity plots: `notebooks/01_explore.ipynb`.
+
+**What produces what:** `run_offline.py` writes the **dataset** (`outputs/task04_dataset.npz` + `.schema.json`), the **replay mp4** (`outputs/replay_task04.mp4`), and the **replay sample frames** (`report/figures/replay_frame_*.png`); `replay_g1.py --compare` writes the **side-by-side** (`outputs/compare_task04.mp4` + `report/figures/compare_frame_*.png`); the notebook `notebooks/01_explore.ipynb` writes the **sanity plots** (`report/figures/plot_*.png`). `outputs/` is gitignored; `report/figures/` is committed.
