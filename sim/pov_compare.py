@@ -31,7 +31,7 @@ def _pose_cache_path(name): return REPO / "outputs" / f"pose_cache_{name}.npz"
 
 
 def get_pose(recording, name, use_cache=True):
-    from data_pipeline.pose_extract import extract_pose
+    from data_pipeline.pose_extract import extract_pose, attach_thumb_dists
     cache = _pose_cache_path(name)
     if use_cache and cache.exists():
         print(f"[pov] loading cached pose {cache.name}")
@@ -41,6 +41,7 @@ def get_pose(recording, name, use_cache=True):
                 "timestamps": z["timestamps"]}
         for s in ("left", "right"):
             pose[s] = {k[len(s) + 1:]: z[k] for k in z.files if k.startswith(s + "_")}
+        attach_thumb_dists(pose)     # compute CHANGE-4 descriptor from cached landmarks
         return pose
     pose = extract_pose(pathlib.Path(recording) / "base.mp4")
     flat = {"fps": pose["fps"], "n_frames": pose["n_frames"], "width": pose["width"],
@@ -70,7 +71,8 @@ def run_pipeline(recording, name, use_cache):
         traj[fi] = rt.solve_frame(
             {s: targets[s][fi] for s in ("left", "right")}, lean[fi], present,
             {s: pose[s]["curl"][fi] for s in ("left", "right")},
-            {s: float(pose[s]["pinch"][fi]) for s in ("left", "right")})
+            {s: float(pose[s]["pinch"][fi]) for s in ("left", "right")},
+            {s: pose[s]["thumb_dists"][fi] for s in ("left", "right")})
     return pose, targets, lean, traj, rt
 
 
@@ -152,6 +154,40 @@ def render_pov(rt, qpos, cam_id, renderer):
     return renderer.render()                     # RGB
 
 
+def render_clip(rec, pose, traj, rt, n, out_mp4):
+    """Render the best-right-hand-coverage contiguous n-frame window as a
+    side-by-side mp4 (source+overlay ∥ POV replay). Returns (start, end, coverage)."""
+    import cv2, mujoco
+    T = pose["n_frames"]; fps = pose["fps"] or 30.0
+    pr = pose["right"]["present"][:T].astype(int)
+    n = min(n, T)
+    csum = np.concatenate([[0], np.cumsum(pr)])
+    win = csum[n:] - csum[:-n]                       # right-present count per window
+    start = int(np.argmax(win)); end = start + n
+    cov = float(win[start]) / n
+    cam = mujoco.mj_name2id(rt.m, mujoco.mjtObj.mjOBJ_CAMERA, "pov_head")
+    R = mujoco.Renderer(rt.m, height=480, width=640)
+    cap = cv2.VideoCapture(str(rec / "base.mp4"))
+    out_mp4 = pathlib.Path(out_mp4); out_mp4.parent.mkdir(parents=True, exist_ok=True)
+    vw = cv2.VideoWriter(str(out_mp4), cv2.VideoWriter_fourcc(*"mp4v"), fps, (1280, 480))
+    for fi in range(start, end):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, fi); ok, fr = cap.read()
+        left = draw_hand_overlay(cv2.resize(fr, (640, 480)), pose, fi) if ok else np.zeros((480, 640, 3), np.uint8)
+        right = cv2.cvtColor(render_pov(rt, traj[fi], cam, R), cv2.COLOR_RGB2BGR)
+        combo = np.hstack([left, right])
+        cv2.rectangle(combo, (0, 0), (1280, 28), (0, 0, 0), -1)
+        cv2.putText(combo, "SOURCE + MediaPipe", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
+        cv2.putText(combo, f"POV replay (tuned)  f={fi}  t={fi/fps:.2f}s", (650, 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
+        vw.write(combo)
+        if (fi - start) % 50 == 0:
+            print(f"  [clip] {fi-start}/{n}")
+    cap.release(); vw.release()
+    print(f"[pov] clip → {out_mp4}  frames {start}-{end-1} (t {start/fps:.1f}-{end/fps:.1f}s)  "
+          f"right-hand coverage {cov*100:.1f}%")
+    return start, end, cov
+
+
 def main():
     import cv2, mujoco
     ap = argparse.ArgumentParser(description="POV side-by-side IK diagnosis harness")
@@ -159,6 +195,9 @@ def main():
                     help="recording dir (default: first under data/task_04_pasteur_pipette)")
     ap.add_argument("--name", default="task04")
     ap.add_argument("--no-cache", action="store_true", help="force MediaPipe re-extraction")
+    ap.add_argument("--clip", type=int, default=0,
+                    help="also render an N-frame best-coverage side-by-side mp4")
+    ap.add_argument("--clip-out", default="outputs/tuned_compare_250.mp4")
     args = ap.parse_args()
     rec = args.recording
     if rec is None:
@@ -205,6 +244,9 @@ def main():
     print_thumb_diag(rt, traj, chosen, pose)
     print_headtilt_diag(rt, traj, chosen, lean)
     print_mismatch_diag(rt, traj, chosen, pose)
+
+    if args.clip:
+        render_clip(rec, pose, traj, rt, args.clip, REPO / args.clip_out)
 
 
 def print_mismatch_diag(rt, traj, chosen, pose):

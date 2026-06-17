@@ -11,9 +11,9 @@ G1+Inspire qpos target:
     task row), so torso lean and arm reach cooperate rather than fight.
   * Fingers: per-finger curl → Inspire finger joint angles (independent joints,
     no 6→12 coupling, matching the model). Thumb opposition from pinch.
-  * STOW per arm when its hand isn't present: upper arm down, forearm forward
-    (elbow≈0 → ~90° L), wrists 0, fingers relaxed open. A hold-last-valid window
-    bridges brief dropouts before easing to stow.
+  * STOW per arm when its hand isn't present: arm hangs straight DOWN (upper arm
+    down, forearm down, out of the POV frame), wrists 0, fingers relaxed open. A
+    hold-last-valid window bridges brief dropouts before easing to stow.
   * Safety: per-joint rate limiting so motion eases (esp. on dropout/stow).
 
 Names/indices are all read from the model — nothing hardcoded.
@@ -30,12 +30,27 @@ HOLD_FRAMES = 6          # frames to hold last-valid arm pose before stowing
 RATE_ARM = 0.18          # max |Δ| per frame (rad) for arm/waist joints
 RATE_FINGER = 0.35       # max |Δ| per frame (rad) for finger joints
 PINCH_REF = 0.12         # pinch (norm units) below which thumb fully opposes
+# CHANGE 4: distance-based finger/thumb retargeting. Map the human normalized
+# thumb-tip↔fingertip distance to a "closeness" in [0,1] (1 = tips touching) and
+# drive BOTH that finger's flexion AND the thumb's flexion toward it, so the thumb
+# actually FLEXES into pinches/grasps (the old curl-scalar map left it only
+# opposing). D_MIN/D_MAX = normalized distances for fully-closed / fully-open.
+D_MIN, D_MAX = 0.15, 0.90
 
 _ARM_J = ["shoulder_pitch", "shoulder_roll", "shoulder_yaw", "elbow",
           "wrist_roll", "wrist_pitch", "wrist_yaw"]
-_WAIST_J = ["waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint"]
+# CHANGE 2: torso stays UPRIGHT. Only waist_yaw is driven (by head-IMU yaw, so the
+# robot turns to face where the person looked); waist_roll & waist_pitch are
+# intentionally LOCKED to 0 — no leaning. (This also fixes a prior axis-mismap
+# where the lean vector [roll,pitch,yaw] was paired against [yaw,roll,pitch].)
+_WAIST_YAW = "waist_yaw_joint"
+_WAIST_LOCKED = ["waist_roll_joint", "waist_pitch_joint"]
+# STOW = arm hangs straight DOWN (idle), out of the downward POV frame.
+# elbow≈π/2 folds the forearm from the rest L-shape down to parallel with the
+# (downward) upper arm → whole arm vertical. (Was elbow=0 → forearm forward,
+# which sat in the POV frame and misled diagnosis.)
 STOW = {"shoulder_pitch": 0.0, "shoulder_roll": 0.0, "shoulder_yaw": 0.0,
-        "elbow": 0.0, "wrist_roll": 0.0, "wrist_pitch": 0.0, "wrist_yaw": 0.0}
+        "elbow": 1.5708, "wrist_roll": 0.0, "wrist_pitch": 0.0, "wrist_yaw": 0.0}
 
 
 class Retargeter:
@@ -49,7 +64,8 @@ class Retargeter:
         self.jrange = lambda n: m.jnt_range[jid(n)]
 
         self.arm_j = {s: [f"{s}_{j}_joint" for j in _ARM_J] for s in ("left", "right")}
-        self.waist_j = list(_WAIST_J)
+        self.waist_j = [_WAIST_YAW]               # only yaw is a controlled waist DoF
+        self.waist_locked = list(_WAIST_LOCKED)   # roll & pitch forced to 0 (upright)
         self.hand_body = {s: mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY,
                           f"{'L' if s == 'left' else 'R'}_hand_base_link") for s in ("left", "right")}
         # finger joints grouped by side, by mediapipe finger
@@ -70,19 +86,35 @@ class Retargeter:
         self.miss = {"left": HOLD_FRAMES + 1, "right": HOLD_FRAMES + 1}
         self.last_arm_q = {s: np.array([self.q[self.qadr(j)] for j in self.arm_j[s]]) for s in ("left", "right")}
 
-    # ── finger curl → joint targets ─────────────────────────────────────────
-    def _set_fingers(self, q, side, curl, pinch):
+    # ── finger/thumb retargeting (CHANGE 4: distance-driven) ─────────────────
+    def _set_fingers(self, q, side, curl, pinch, thumb_dists=None):
+        """Drive each finger from max(curl_fallback, thumb-closeness) so it meets
+        the thumb in a pinch; drive the thumb FLEXION from the most-engaged finger
+        (not just opposition). thumb_dists: (4,) normalized thumb↔[idx,mid,ring,pinky]
+        distances; None → curl-only fallback."""
+        def setj(j, v01):
+            lo, hi = self.jrange(j); q[self.qadr(j)] = lo + float(np.clip(v01, 0, 1)) * (hi - lo)
+
         fg = self.finger_j[side]
-        order = {"thumb": 0, "index": 1, "middle": 2, "ring": 3, "pinky": 4}
-        for fname, k in order.items():
+        fingers = [("index", 1, 0), ("middle", 2, 1), ("ring", 3, 2), ("pinky", 4, 3)]
+        max_close = 0.0
+        for fname, curl_idx, di in fingers:
+            close = 0.0
+            if thumb_dists is not None and np.isfinite(thumb_dists[di]):
+                close = 1.0 - np.clip((thumb_dists[di] - D_MIN) / (D_MAX - D_MIN), 0, 1)
+            flex = max(float(np.clip(curl[curl_idx], 0, 1)), float(close))  # curl is the fallback
             for j in fg[fname]:
-                lo, hi = self.jrange(j)
-                q[self.qadr(j)] = lo + float(np.clip(curl[k], 0, 1)) * (hi - lo)
-        # thumb opposition from pinch: tighter pinch → more yaw toward index
+                setj(j, flex)
+            max_close = max(max_close, close)
+        # thumb FLEXION tracks the most-engaged fingertip (so it bends into pinches),
+        # falling back to the thumb curl when no finger is engaged
+        thumb_flex = max(float(np.clip(curl[0], 0, 1)), float(max_close))
+        for j in fg["thumb"]:
+            setj(j, thumb_flex)
+        # thumb opposition (yaw): tighter thumb-index pinch → more yaw toward index
         opp = 1.0 - float(np.clip((pinch if np.isfinite(pinch) else PINCH_REF) / PINCH_REF, 0, 1))
         for j in fg["thumb_yaw"]:
-            lo, hi = self.jrange(j)
-            q[self.qadr(j)] = lo + opp * (hi - lo)
+            setj(j, opp)
 
     def _open_fingers(self, q, side):
         for fname, js in self.finger_j[side].items():
@@ -91,14 +123,14 @@ class Retargeter:
                 q[self.qadr(j)] = lo          # lower limit = relaxed open
 
     # ── DLS IK over waist + present arms ──────────────────────────────────────
-    def _ik(self, q, active, targets, lean):
+    def _ik(self, q, active, targets, yaw_target):
         m, d = self.m, self.d
-        dofs = [self.dadr(j) for j in self.waist_j]
+        dofs = [self.dadr(j) for j in self.waist_j]      # [waist_yaw] only
         for s in active:
             dofs += [self.dadr(j) for j in self.arm_j[s]]
         dofs = np.array(dofs)
-        waist_dofs = [self.dadr(j) for j in self.waist_j]
-        waist_q_idx = [self.qadr(j) for j in self.waist_j]
+        yaw_dof = self.dadr(_WAIST_YAW)
+        yaw_q = self.qadr(_WAIST_YAW)
         jacp = np.zeros((3, m.nv))
         for _ in range(IK_ITERS):
             d.qpos[:] = q
@@ -108,12 +140,11 @@ class Retargeter:
                 mujoco.mj_jacBody(m, d, jacp, None, self.hand_body[s])
                 rows_J.append(jacp[:, dofs])
                 rows_e.append(targets[s] - d.xpos[self.hand_body[s]])
-            # soft waist→lean bias rows (selector on waist dofs)
-            sel = np.zeros((3, len(dofs)))
-            for r, wd in enumerate(waist_dofs):
-                sel[r, list(dofs).index(wd)] = WAIST_BIAS_W
+            # soft waist_yaw→head-yaw bias (single row; roll/pitch are locked, not solved)
+            sel = np.zeros((1, len(dofs)))
+            sel[0, list(dofs).index(yaw_dof)] = WAIST_BIAS_W
             rows_J.append(sel)
-            rows_e.append(WAIST_BIAS_W * (lean - q[waist_q_idx]))
+            rows_e.append(np.array([WAIST_BIAS_W * (yaw_target - q[yaw_q])]))
             J = np.vstack(rows_J); e = np.concatenate(rows_e)
             JJt = J @ J.T + (DLS_LAMBDA ** 2) * np.eye(J.shape[0])
             dq = J.T @ np.linalg.solve(JJt, e)
@@ -141,18 +172,24 @@ class Retargeter:
             q[a] = np.clip(q[a], lo, hi)
 
     # ── main per-frame entry ─────────────────────────────────────────────────
-    def solve_frame(self, targets, lean, present, curl, pinch):
-        """targets:{side:(3,)} lean:(3,) present:{side:bool} curl:{side:(5,)} pinch:{side:float}.
+    def solve_frame(self, targets, lean, present, curl, pinch, thumb_dists=None):
+        """targets:{side:(3,)} lean:(3,) present:{side:bool} curl:{side:(5,)} pinch:{side:float}
+        thumb_dists:{side:(4,)} normalized thumb↔fingertip distances (CHANGE 4) or None.
         Returns a full qpos target (rate-limited from the previous frame)."""
+        thumb_dists = thumb_dists or {"left": None, "right": None}
         q_des = self.q.copy()                      # warm start; legs/base stay frozen
         active = [s for s in ("left", "right") if present[s] and np.all(np.isfinite(targets[s]))]
 
+        yaw_target = float(lean[2])                # lean = [roll, pitch, yaw]; use yaw only
         if active:
-            q_des = self._ik(q_des, active, targets, lean)
+            q_des = self._ik(q_des, active, targets, yaw_target)
         else:
-            # no arms: still lean the waist toward the IMU target
-            for r, j in enumerate(self.waist_j):
-                lo, hi = self.jrange(j); q_des[self.qadr(j)] = np.clip(lean[r], lo, hi)
+            # no arms: still turn the waist toward the head-yaw target
+            lo, hi = self.jrange(_WAIST_YAW)
+            q_des[self.qadr(_WAIST_YAW)] = np.clip(yaw_target, lo, hi)
+        # CHANGE 2: keep the torso vertical — lock roll & pitch to 0 (no leaning)
+        for j in self.waist_locked:
+            q_des[self.qadr(j)] = 0.0
 
         # per-arm: commit IK result / hold-last-valid / ease to stow
         for s in ("left", "right"):
@@ -169,7 +206,7 @@ class Retargeter:
                         q_des[self.qadr(jn)] = STOW[jk]
             # fingers
             if present[s]:
-                self._set_fingers(q_des, s, curl[s], pinch[s])
+                self._set_fingers(q_des, s, curl[s], pinch[s], thumb_dists[s])
             else:
                 self._open_fingers(q_des, s)
 
@@ -182,6 +219,8 @@ class Retargeter:
         limit(self.waist_j + self.arm_j["left"] + self.arm_j["right"], RATE_ARM)
         for s in ("left", "right"):
             limit(sum(self.finger_j[s].values(), []), RATE_FINGER)
+        for j in self.waist_locked:               # keep torso upright after limiting too
+            q_new[self.qadr(j)] = 0.0
         self.q = q_new
         return q_new.copy()
 
