@@ -80,9 +80,12 @@ def build_dataset(recording, name, max_frames):
         "inspire": "unitree_ros g1_description/inspire_hand DFQ @7c40519",
         "nu": int(rt.m.nu), "nq": int(rt.m.nq),
     }
-    data = assemble(pose, targets, lean, traj, model_meta)
+    from data_pipeline.build_dataset import actuated_columns
+    act_names, act_qadr = actuated_columns(rt.m)
+    joint_targets = traj[:, act_qadr]                     # (T, 53) actuated only
+    data = assemble(pose, targets, lean, traj, imeta, joint_targets, act_names, model_meta)
     out_npz = REPO / "outputs" / f"{name}_dataset.npz"
-    npz, js = save(data, qpos_layout_from_model(rt.m), model_meta, out_npz)
+    npz, js = save(data, qpos_layout_from_model(rt.m), act_names, model_meta, out_npz)
     # validation summary
     cov = {s: float(pose[s]["present"][:T].mean()) for s in ("left", "right")}
     any_present = np.array([pose["left"]["present"][:T] | pose["right"]["present"][:T]]).mean()
