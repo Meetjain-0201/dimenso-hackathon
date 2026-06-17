@@ -30,6 +30,12 @@ HOLD_FRAMES = 6          # frames to hold last-valid arm pose before stowing
 RATE_ARM = 0.18          # max |Δ| per frame (rad) for arm/waist joints
 RATE_FINGER = 0.35       # max |Δ| per frame (rad) for finger joints
 PINCH_REF = 0.12         # pinch (norm units) below which thumb fully opposes
+# CHANGE 4: distance-based finger/thumb retargeting. Map the human normalized
+# thumb-tip↔fingertip distance to a "closeness" in [0,1] (1 = tips touching) and
+# drive BOTH that finger's flexion AND the thumb's flexion toward it, so the thumb
+# actually FLEXES into pinches/grasps (the old curl-scalar map left it only
+# opposing). D_MIN/D_MAX = normalized distances for fully-closed / fully-open.
+D_MIN, D_MAX = 0.15, 0.90
 
 _ARM_J = ["shoulder_pitch", "shoulder_roll", "shoulder_yaw", "elbow",
           "wrist_roll", "wrist_pitch", "wrist_yaw"]
@@ -80,19 +86,35 @@ class Retargeter:
         self.miss = {"left": HOLD_FRAMES + 1, "right": HOLD_FRAMES + 1}
         self.last_arm_q = {s: np.array([self.q[self.qadr(j)] for j in self.arm_j[s]]) for s in ("left", "right")}
 
-    # ── finger curl → joint targets ─────────────────────────────────────────
-    def _set_fingers(self, q, side, curl, pinch):
+    # ── finger/thumb retargeting (CHANGE 4: distance-driven) ─────────────────
+    def _set_fingers(self, q, side, curl, pinch, thumb_dists=None):
+        """Drive each finger from max(curl_fallback, thumb-closeness) so it meets
+        the thumb in a pinch; drive the thumb FLEXION from the most-engaged finger
+        (not just opposition). thumb_dists: (4,) normalized thumb↔[idx,mid,ring,pinky]
+        distances; None → curl-only fallback."""
+        def setj(j, v01):
+            lo, hi = self.jrange(j); q[self.qadr(j)] = lo + float(np.clip(v01, 0, 1)) * (hi - lo)
+
         fg = self.finger_j[side]
-        order = {"thumb": 0, "index": 1, "middle": 2, "ring": 3, "pinky": 4}
-        for fname, k in order.items():
+        fingers = [("index", 1, 0), ("middle", 2, 1), ("ring", 3, 2), ("pinky", 4, 3)]
+        max_close = 0.0
+        for fname, curl_idx, di in fingers:
+            close = 0.0
+            if thumb_dists is not None and np.isfinite(thumb_dists[di]):
+                close = 1.0 - np.clip((thumb_dists[di] - D_MIN) / (D_MAX - D_MIN), 0, 1)
+            flex = max(float(np.clip(curl[curl_idx], 0, 1)), float(close))  # curl is the fallback
             for j in fg[fname]:
-                lo, hi = self.jrange(j)
-                q[self.qadr(j)] = lo + float(np.clip(curl[k], 0, 1)) * (hi - lo)
-        # thumb opposition from pinch: tighter pinch → more yaw toward index
+                setj(j, flex)
+            max_close = max(max_close, close)
+        # thumb FLEXION tracks the most-engaged fingertip (so it bends into pinches),
+        # falling back to the thumb curl when no finger is engaged
+        thumb_flex = max(float(np.clip(curl[0], 0, 1)), float(max_close))
+        for j in fg["thumb"]:
+            setj(j, thumb_flex)
+        # thumb opposition (yaw): tighter thumb-index pinch → more yaw toward index
         opp = 1.0 - float(np.clip((pinch if np.isfinite(pinch) else PINCH_REF) / PINCH_REF, 0, 1))
         for j in fg["thumb_yaw"]:
-            lo, hi = self.jrange(j)
-            q[self.qadr(j)] = lo + opp * (hi - lo)
+            setj(j, opp)
 
     def _open_fingers(self, q, side):
         for fname, js in self.finger_j[side].items():
@@ -150,9 +172,11 @@ class Retargeter:
             q[a] = np.clip(q[a], lo, hi)
 
     # ── main per-frame entry ─────────────────────────────────────────────────
-    def solve_frame(self, targets, lean, present, curl, pinch):
-        """targets:{side:(3,)} lean:(3,) present:{side:bool} curl:{side:(5,)} pinch:{side:float}.
+    def solve_frame(self, targets, lean, present, curl, pinch, thumb_dists=None):
+        """targets:{side:(3,)} lean:(3,) present:{side:bool} curl:{side:(5,)} pinch:{side:float}
+        thumb_dists:{side:(4,)} normalized thumb↔fingertip distances (CHANGE 4) or None.
         Returns a full qpos target (rate-limited from the previous frame)."""
+        thumb_dists = thumb_dists or {"left": None, "right": None}
         q_des = self.q.copy()                      # warm start; legs/base stay frozen
         active = [s for s in ("left", "right") if present[s] and np.all(np.isfinite(targets[s]))]
 
@@ -182,7 +206,7 @@ class Retargeter:
                         q_des[self.qadr(jn)] = STOW[jk]
             # fingers
             if present[s]:
-                self._set_fingers(q_des, s, curl[s], pinch[s])
+                self._set_fingers(q_des, s, curl[s], pinch[s], thumb_dists[s])
             else:
                 self._open_fingers(q_des, s)
 

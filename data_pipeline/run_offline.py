@@ -67,6 +67,7 @@ def build_dataset(recording, name, max_frames):
             present,
             {s: pose[s]["curl"][fi] for s in ("left", "right")},
             {s: float(pose[s]["pinch"][fi]) for s in ("left", "right")},
+            {s: pose[s]["thumb_dists"][fi] for s in ("left", "right")},
         )
         traj[fi] = q
         if fi % 200 == 0:

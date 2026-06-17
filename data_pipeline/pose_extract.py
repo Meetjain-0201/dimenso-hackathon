@@ -87,6 +87,32 @@ def _finger_curl(lm, base, joints):
     return float(np.clip(raw * CURL_GAIN, 0.0, 1.0))
 
 
+_FTIPS = [8, 12, 16, 20]   # index, middle, ring, pinky fingertips (thumb tip = 4)
+
+
+def attach_thumb_dists(pose):
+    """Add pose[side]['thumb_dists'] (T,4): thumb-tip↔fingertip distance for
+    [index,middle,ring,pinky], normalized by hand scale. Computed from the
+    (filtered) landmarks so it works on freshly-extracted OR cached pose.
+    Used by CHANGE 4 (distance-based finger/thumb retargeting). Idempotent."""
+    for s in ("left", "right"):
+        lm = pose[s]["landmarks"]
+        T = lm.shape[0]
+        td = np.full((T, 4), np.nan)
+        for fi in range(T):
+            L = lm[fi]
+            if np.any(np.isnan(L[4])):
+                continue
+            span = np.nanmax(L[:, :2], 0) - np.nanmin(L[:, :2], 0)
+            sc = float(np.hypot(*span))
+            if not np.isfinite(sc) or sc < 1e-6:
+                continue
+            for j, ft in enumerate(_FTIPS):
+                td[fi, j] = float(np.linalg.norm(L[4] - L[ft]) / sc)
+        pose[s]["thumb_dists"] = td
+    return pose
+
+
 def extract_pose(video_path, conf_gate=CONF_GATE, max_frames=None, progress=True):
     """Run MediaPipe Hands over the video. Returns dict of per-frame arrays."""
     import cv2
@@ -156,6 +182,7 @@ def extract_pose(video_path, conf_gate=CONF_GATE, max_frames=None, progress=True
             if progress and fi % 200 == 0:
                 print(f"  [pose] frame {fi}/{nf}")
     cap.release()
+    attach_thumb_dists(out)                     # CHANGE 4 descriptor
     for s in sides:
         cov = out[s]["present"][: out["n_frames"]].mean() * 100
         print(f"  [pose] {s}: {cov:.1f}% frames present")

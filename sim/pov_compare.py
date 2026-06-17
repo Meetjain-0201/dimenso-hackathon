@@ -31,7 +31,7 @@ def _pose_cache_path(name): return REPO / "outputs" / f"pose_cache_{name}.npz"
 
 
 def get_pose(recording, name, use_cache=True):
-    from data_pipeline.pose_extract import extract_pose
+    from data_pipeline.pose_extract import extract_pose, attach_thumb_dists
     cache = _pose_cache_path(name)
     if use_cache and cache.exists():
         print(f"[pov] loading cached pose {cache.name}")
@@ -41,6 +41,7 @@ def get_pose(recording, name, use_cache=True):
                 "timestamps": z["timestamps"]}
         for s in ("left", "right"):
             pose[s] = {k[len(s) + 1:]: z[k] for k in z.files if k.startswith(s + "_")}
+        attach_thumb_dists(pose)     # compute CHANGE-4 descriptor from cached landmarks
         return pose
     pose = extract_pose(pathlib.Path(recording) / "base.mp4")
     flat = {"fps": pose["fps"], "n_frames": pose["n_frames"], "width": pose["width"],
@@ -70,7 +71,8 @@ def run_pipeline(recording, name, use_cache):
         traj[fi] = rt.solve_frame(
             {s: targets[s][fi] for s in ("left", "right")}, lean[fi], present,
             {s: pose[s]["curl"][fi] for s in ("left", "right")},
-            {s: float(pose[s]["pinch"][fi]) for s in ("left", "right")})
+            {s: float(pose[s]["pinch"][fi]) for s in ("left", "right")},
+            {s: pose[s]["thumb_dists"][fi] for s in ("left", "right")})
     return pose, targets, lean, traj, rt
 
 
