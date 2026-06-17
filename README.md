@@ -19,18 +19,40 @@ selected (TBD) after reviewing the actual recordings.
 
 ## Data
 
-The dataset lives in **`mentra-pull/`** at the repo root. It is **gitignored and
-NOT committed** — recordings (video/IMU) stay local. Generated artifacts
-(`data/`, `outputs/`, `*.mp4`, `*.npz`) are likewise excluded.
+Recordings live under **`data/<task>/<...>/{base.mp4, imu.json}`** at the repo root.
+`data/` is **gitignored and NOT committed** — video/IMU stay local. Generated
+artifacts (`outputs/`, `*.mp4`, `*.npz`) are excluded too. Model assets
+(`sim/assets/g1/`, `sim/assets/inspire/`) and report figures **are** committed.
 
 ## Reproduce
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-# TODO: run commands for the pipeline once stubs are implemented, e.g.
-#   python -m data_pipeline.inspect <recording>
-#   python -m data_pipeline.build_dataset ...
-#   python sim/replay_g1.py ...
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt          # numpy, opencv, scipy, matplotlib, mediapipe, mujoco
 ```
+
+### Offline motion-translation engine (egocentric video + IMU → G1+Inspire replay)
+
+Render uses `MUJOCO_GL=glfw` (osmesa/egl fail on this box — see docs/diagnostics.md).
+
+```bash
+# Build the dataset + render the replay mp4 (+ sample frames).
+# Default recording: first under data/task_04_pasteur_pipette/
+MUJOCO_GL=glfw python -m data_pipeline.run_offline
+#   → outputs/task04_dataset.npz (+ .schema.json)   ← the dataset deliverable
+#   → outputs/replay_task04.mp4                       ← G1+Inspire replay
+#   → report/figures/replay_frame_*.png
+
+# Same, but also drive the LIVE passive viewer in real time:
+MUJOCO_GL=glfw python -m data_pipeline.run_offline --live
+
+# Point at any recording explicitly:
+MUJOCO_GL=glfw python -m data_pipeline.run_offline data/task_04_pasteur_pipette/<rec> --name task04
+
+# Frame-aligned side-by-side (source video ∥ replay):
+MUJOCO_GL=glfw python sim/replay_g1.py --dataset outputs/task04_dataset.npz \
+    --compare data/task_04_pasteur_pipette/<rec>/base.mp4 --mp4 outputs/compare_task04.mp4
+```
+
+Individual stages are runnable too (`python -m data_pipeline.pose_extract <rec>`, etc.).
+Sanity plots: `notebooks/01_explore.ipynb`.
