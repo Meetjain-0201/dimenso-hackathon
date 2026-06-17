@@ -1,56 +1,196 @@
-# Dimenso Hackathon Report
+# Dimenso Hackathon Report — egocentric lab demo → Unitree G1 + Inspire in simulation
 
-Egocentric smart-glasses RGB video + head IMU → recovered human motion →
-retargeted onto a Unitree **G1 with five-finger Inspire hands** → replayed in
-MuJoCo. **Motion translation only** (no object interaction / manipulation
-planning). Task used: `task_04_pasteur_pipette`.
+Recover human **hand and arm** motion from smart-glasses head-cam RGB + head IMU,
+retarget it onto a Unitree **G1 with five-finger Inspire hands**, and replay it in
+MuJoCo. **Motion translation only** — human demo in, robot joint trajectory out,
+replayed in sim. No object interaction or manipulation planning.
 
-## Problem framing & assumptions
-- **In:** one recording = `base.mp4` (egocentric head-cam RGB, 1920×1080 @ ~29.6 fps) + `imu.json` (head IMU, ~100 Hz, `[ts_ms, accel xyz, gyro xyz]`). **Out:** a per-frame G1+Inspire joint trajectory + a MuJoCo replay.
-- **Full-body pose is NOT recoverable** from a forward head-cam (diagnostics: only 29% of frames return any MediaPipe Pose; lower-body visibility collapses). So the design is reframed: **legs frozen** at the stand keyframe; **torso/waist** driven by the head IMU; **arms + hands** driven by MediaPipe hand tracking. The G1 has **no neck joint**, so head orientation drives the **3 waist joints only**.
-- **RGB-only, no depth** → the 3D wrist target is **approximated** (documented below and in code).
-- **No shared video↔IMU clock** → we assume IMU sample 0 = video frame 0 (durations agree to ~0.12 s).
+> **Note on numbers.** Coverage, timing, and dataset figures below are *measured*
+> from the diagnostics pass and the offline run. Quantitative motion-fidelity
+> figures (reach/tracking error, rollout success) depend on an IK-tuning pass that
+> is still to come and are marked **`TODO (post-IK-tuning)`** rather than guessed.
 
-## Data pipeline (the centerpiece)
-`data_pipeline/run_offline.py` chains five stages (all joint/actuator names read
-from the model via MuJoCo — nothing hardcoded):
+---
 
-1. **`pose_extract.py`** — decode video (real per-frame timestamps), MediaPipe Hands per frame (21 landmarks + handedness + confidence). A **One Euro filter** (Casiez et al., CHI 2012) de-jitters every landmark coordinate; detections are confidence-gated. Derives per-finger **curl** (path-length ratio) and thumb-index **pinch**. Handedness is flipped for the non-mirrored egocentric view.
-2. **`imu_sync.py`** — **resamples the jittery IMU onto the video frame timestamps** (not a fixed 10 ms grid); recovers head orientation with a complementary filter (gravity-from-accel for roll/pitch, gyro integration, yaw leak for drift); outputs a per-frame **waist-lean target relative to the recording's first frame**, clamped ±30°.
-3. **`stabilize.py`** — lifts the 2D wrist landmark to an **approximate 3D workspace target** on a table plane (image-u → lateral y, image-v → forward x, apparent hand scale + MediaPipe relative z → height/depth). All constants are commented tunables. **Heavily approximate — not a calibrated reconstruction.**
-4. **`method/retarget.py`** — **DLS IK** (MuJoCo body Jacobians) drives each present wrist to its 3D target; the **3 waist joints are shared IK DoF** with a **soft bias** to the IMU lean, so reach and lean cooperate. Both arms solved jointly. Finger curl → Inspire finger joints (independent, no coupling). **Per-arm stow** (upper arm down, forearm forward ~90°, fingers open) when a hand isn't seen, with a hold-last-valid window and per-joint **rate limiting** for smooth eases.
-5. **`build_dataset.py`** — writes **`outputs/task04_dataset.npz`** + a `.schema.json` documenting every array and approximation. This file is the deliverable; the replay consumes its `qpos` trajectory.
+## 1. Problem framing & assumptions
 
-## Method (perception → retargeting → imitation learning → simulation)
-Perception (MediaPipe Hands + IMU) → approximate 3D targets → DLS IK + finger/lean
-mapping → full G1+Inspire `qpos` per frame → MuJoCo kinematic replay
-(`sim/replay_g1.py`: offscreen mp4 + live passive viewer; legs frozen at stand).
-**Imitation learning is a sketch only — none was trained** (see `method/policy_sketch.md`); the dataset is structured so behavior cloning *could* consume it later.
+We chose **task_04 (Pasteur-pipette)** from the four recorded lab tasks. The choice
+is grounded in the diagnostics hand-detection sweep (`docs/diagnostics.md`): task_04
+had a hand visible in **77.0%** of sampled frames versus 34–49% for the others,
+the **highest** detection confidence (0.976 vs ~0.95), and the **shortest** no-hand
+dropout (~3.4 s vs 5.3–6.1 s). Since hand *presence in frame* — not detector
+quality — is the binding constraint, task_04 is the most tractable demonstration.
 
-## Validation
-Recording `task_04_pasteur_pipette` (first rec), 1431 frames @ 29.6 fps:
-- **Hand-detection coverage:** right **76.5%**, left **26.5%**, **any-hand 79.6%** → **79.6% of frames use real tracking, 20.4% fall back to stow.**
-- **IMU↔video:** durations 48.42 s vs 48.30 s (~0.12 s slack, consistent with the documented sync assumption). Waist lean exercised the full ±30° clamp on roll, ≈0..−30° on pitch.
-- **Replay renders:** `outputs/replay_task04.mp4` ✅ and a frame-aligned side-by-side `outputs/compare_task04.mp4` ✅ (`report/figures/compare_frame_*.png`).
-- **Live viewer:** `--live` plays the trajectory in real time in a passive MuJoCo viewer ✅ (visually spot-checked against the source video).
-- Sanity plots (`notebooks/01_explore.ipynb` → `report/figures/plot_*.png`): wrist trajectory, hand-present timeline, waist-lean vs IMU.
+The core reframe of the project: **a forward-facing egocentric camera recovers hands
+and forearms, not the full body.** The diagnostics Pose sanity check is blunt about
+this — only **29% of frames return any MediaPipe Pose result**, and when one fires
+the lower body is unreliable (knee visibility 0.46, ankle 0.22; the high shoulder/hip
+"visibility" is the model hallucinating an unseen torso). We therefore do **not**
+attempt whole-body capture. Instead we translate hand+arm motion onto the G1's
+**upper body**, **freeze the legs** at the stand keyframe, and drive the **torso/waist
+from the head IMU** (the G1 has no neck joint, so head orientation maps to the 3
+waist joints only).
 
-**Measured vs approximate:** coverage, timing, joint trajectories, render success are *measured*. Wrist **depth/3D position** and the **video↔IMU offset** are *approximated* and clearly marked.
+Hand assumption: the demonstrator's dexterous motion is mapped onto a **five-finger
+Inspire DFQ hand grafted onto the menagerie G1** — a single MuJoCo model with
+**53 actuated DoF** (29 G1 + 24 finger joints), documented in
+`docs/inspire_hand_model.md`. The robot works over a white table whose top sits at
+the same height the pipeline maps wrists onto (0.75 m):
 
-## Feasibility & cost proposal
-Runs **CPU-only** (no GPU needed): MediaPipe ~0.1 s/frame; IK + render negligible; full recording processes offline in ~3–4 min on the dev laptop. The engine is offline by design — perception is too slow for 30 fps live, so we precompute the trajectory once and replay it in real time. Scaling to many recordings is embarrassingly parallel. No paid services used.
+![G1 + Inspire behind the work table](../sim/assets/diag_scene_table.png)
 
-## Limitations & next steps
-**Known weak spots (v1 — needs tuning):**
-- **Depth is guessed** (RGB-only): reach *direction* tracks well, absolute forward/height is approximate — the most visible source of error. A second camera or a learned monocular-depth prior would fix this.
-- **Left arm mostly stowed** (26.5% coverage) — bimanual sub-tasks render one-handed. Better hand re-acquisition / wider FoV would help.
-- **IMU yaw drifts** (leaked, no magnetometer); **video↔IMU offset** unverified (~2–3 frames).
-- Waist→lean and finger curl→joint gains are hand-tuned, not calibrated.
-- Inspire fingers modeled as **independent joints** (real hand is ~6-motor underactuated) — deliberate simplification.
+## 2. Data pipeline (the centerpiece)
 
-**Next:** calibrate the workspace mapping against a known scene; add a depth/scale prior; detect a shared video/IMU sync event; tune IK weights & rate limits; (later) train a BC policy on the dataset.
+`data_pipeline/run_offline.py` chains five stages; all joint/actuator names are read
+from the MuJoCo model at run time, nothing hardcoded.
 
-## References
-- MediaPipe Hands — Google. One Euro filter — Casiez, Roussel, Vogel, CHI 2012, https://gery.casiez.net/1euro/
-- G1 base: `mujoco_menagerie/unitree_g1` (`accb6df`). Inspire hands: `unitreerobotics/unitree_ros` `g1_description/inspire_hand` DFQ (`7c40519`). MuJoCo, Google DeepMind.
-- See also `docs/diagnostics.md`, `docs/inspire_hand_model.md`.
+**Perception.** The video is decoded with real per-frame timestamps; **MediaPipe
+Hands** runs per frame for 21 landmarks/hand with handedness and confidence.
+Landmark coordinates are de-jittered by a **One Euro filter** (Casiez et al., 2012),
+and detections below a confidence gate are dropped. We derive a per-finger **curl**
+descriptor (path-length ratio) and a thumb-index **pinch** distance. Handedness is
+flipped for the non-mirrored egocentric view.
+
+**Head IMU → waist lean.** Diagnostics showed the IMU is ~100 Hz but with jittery
+per-sample dt (1–18 ms), so we **resample the IMU onto the video frame timestamps**
+rather than assume a fixed 10 ms grid. Head orientation comes from a complementary
+filter — gravity-from-accelerometer for roll/pitch, gyro integration for change,
+expressed **relative to the recording's first frame** — and is clamped to **±30°**
+before driving the waist.
+
+**2D → 3D wrist target (approximated).** With RGB only and no depth, the 3D wrist
+target is **approximated**: the wrist's image position maps onto a horizontal table
+plane in front of the robot, and apparent hand scale (+ MediaPipe's weak relative z)
+acts as a height/depth proxy. We say this plainly — it is a monotonic guess, not a
+calibrated reconstruction, and it is the largest single source of error.
+
+**Output.** `outputs/task04_dataset.npz` + a `task04_dataset.schema.json` sidecar
+document every array: per-frame timestamp, per-hand approximate 3D wrist target,
+per-finger curl/pinch, waist-lean target, per-arm hand-present flag, and the full
+G1+Inspire **`qpos` trajectory** ready for replay. (Outputs are gitignored; the
+schema documentation is the committed record of the format.)
+
+## 3. Method (perception → retargeting → imitation learning → simulation)
+
+**Retargeting.** `method/retarget.py` solves **damped-least-squares IK** using MuJoCo
+body Jacobians so each detected wrist reaches its 3D target. The **3 waist joints are
+included as shared IK DoF**, softly biased toward the IMU lean target, so the torso
+leans to assist long reaches rather than fighting them; both arms are solved jointly
+because they share the waist. Finger curl maps to the Inspire finger joints; when a
+hand isn't visible that arm **stows** (upper arm down, forearm forward ~90°, fingers
+open) after a brief hold-last-valid window; all joint targets are **velocity-clamped**
+so motion eases, especially on stow transitions.
+
+**Imitation learning (a credible plan, not run).** Honestly: **this dataset alone
+cannot train a task policy.** It has no depth, no object/scene state, no reward, and
+is open-loop — it is a *demonstration* signal, not a closed-loop training environment.
+As demonstration data, though, it is a legitimate input to imitation learning. A
+credible path: (a) collect many more demos with **added object perception** — a
+depth sensor or a wrist-mounted RGB-D camera — so the policy can see what it
+manipulates; (b) convert episodes to a standard format (**LeRobot v2**) with
+synchronized proprioception + vision + action; (c) train a **behavior-cloning** or
+**diffusion-policy** baseline with **inputs** = proprioception (G1+Inspire joint
+state) + vision (ego + wrist views) and **outputs** = joint / end-effector targets;
+(d) **validate** on held-out demonstrations and by **sim rollout success rate** on
+the task. A tiny overfit-one-demo sanity run was **out of scope** in the available
+time. Expected baseline numbers are **`TODO (post-IK-tuning + data collection)`**.
+
+**Simulation.** The combined G1+Inspire model loads in MuJoCo with legs frozen at the
+stand keyframe; the retargeted trajectory is replayed both as an offscreen mp4 and in
+a **live native viewer** (`sim/replay_g1.py`, `--live`), which plays the precomputed
+trajectory in real time.
+
+## 4. Validation
+
+On the task_04 recording (1431 frames @ 29.6 fps):
+
+- **Hand-detection coverage / stow:** **79.6% of frames use real tracking, 20.4% fall
+  back to stow** (right hand 76.5%, left 26.5%). The asymmetry means bimanual moments
+  often render one-handed — an honest limitation, not a bug.
+- **IMU↔video timing:** durations 48.42 s (IMU) vs 48.30 s (video) — ~0.12 s slack,
+  consistent with the documented "no shared clock" sync assumption.
+- **Qualitative motion:** the frame-aligned side-by-side (source video ∥ replay)
+  shows the right-arm reach **direction** tracking the demo, with absolute reach
+  **depth** visibly approximate (expected, RGB-only).
+
+![hand-present timeline](figures/plot_hand_presence.png)
+![waist lean vs IMU](figures/plot_waist_lean.png)
+![approx wrist trajectory](figures/plot_wrist_trajectory.png)
+
+Side-by-side (egocentric source ∥ G1+Inspire replay):
+
+![compare mid](figures/compare_frame_1.png)
+![compare late](figures/compare_frame_2.png)
+
+**Quantitative tracking accuracy** (achieved end-effector vs target wrist position,
+and any rollout success metric) is **`TODO (post-IK-tuning)`** — it will move once the
+IK weights/rate-limits are tuned, so we don't report a misleading figure now.
+
+## 5. Feasibility & cost proposal
+
+*(Proposal estimates with stated assumptions, not measured results.)*
+
+**BOM (research MVP).** Egocentric capture with depth — either depth-capable smart
+glasses (research units ~$2–3k) or cheaper standard glasses + a wrist-mounted RGB-D
+camera (e.g. RealSense-class, ~$250–400); one **Unitree G1** (~$16k entry class);
+**two Inspire five-finger hands** (RH56-class, ~$3–5k each); one training workstation
+(a single RTX-4090-class GPU, ~$1.6k, or cloud A100 at ~$1.5–3/hr). Total hardware on
+the order of **$25–35k** for a single-cell prototype, dominated by the robot.
+
+**Data + compute.** A behavior-cloning baseline for one constrained task typically
+needs on the order of **50–200 demonstrations**; at ~1 min/demo that's **~1–4 hours**
+of capture per task, more for a diffusion policy. Training a small BC/diffusion
+baseline is **a few GPU-hours to ~1 GPU-day** on a single modern GPU — cheap relative
+to data collection, which is the real cost driver.
+
+**Prototype → MVP timeline.** Phase 0 (done): offline translation engine + sim replay.
+Phase 1 (~1–2 wks): add a depth/wrist-camera so object state is observable. Phase 2
+(~1 wk): scale demo collection + LeRobot conversion. Phase 3 (~1 wk): train + sim-eval
+a BC baseline. Phase 4 (later): sim-to-real on hardware. **Tradeoff:** the cheap path
+(RGB-only, this engine) gets you motion translation fast but caps at open-loop replay;
+spending on depth + data is what unlocks a closed-loop policy. **Risks:** the
+sim-to-real gap on a dexterous hand, occlusion of the manipulated object in egocentric
+views, and the sheer data scale real manipulation policies demand.
+
+## 6. Limitations & next steps
+
+We are direct about what this does not do:
+
+- **Egocentric depth is approximated** — there is no depth sensor, so the 3D wrist
+  target is a scale/plane heuristic; reach direction is right, absolute depth is a guess.
+- **IMU yaw drifts** (no magnetometer; we leak it toward zero) and there is **no shared
+  IMU↔video clock**, so the start offset is a best-effort assumption (~2–3 frames).
+- **Left-hand coverage is low (26.5%)**, so bimanual moments render one-handed.
+- **Full-body pose is unrecoverable** from the forward cam (the project's founding
+  observation), hence legs frozen + IMU-driven torso.
+- **Inspire underactuation is modeled as independent joints** — the real hand drives
+  ~12 joints from ~6 motors; we drive all 12 independently, a deliberate simplification
+  documented in `docs/inspire_hand_model.md`.
+- **The real-time live web panel was designed but not built** in the time. The concrete
+  threaded architecture (native MuJoCo viewer + solver thread + uvicorn + MJPEG of the
+  annotated video, with frame-dropping to stay on the clock) is written up in
+  `docs/live_architecture.md` — verdict there: live is feasible, biggest risk is GIL/CPU
+  contention.
+
+**Next steps:** tune the DLS IK weights and rate limits (the pending pass), add a depth
+or wrist-cam prior to fix reach depth, detect a shared motion event to pin the
+IMU/video offset, then build the live panel per the architecture doc.
+
+## 7. References
+
+- **MediaPipe Hands** — Zhang et al., "MediaPipe Hands: On-device Real-time Hand
+  Tracking", 2020 (Google).
+- **One Euro filter** — Casiez, Roussel, Vogel, "1€ Filter: A Simple Speed-based
+  Low-pass Filter for Noisy Input in Interactive Systems", CHI 2012,
+  https://gery.casiez.net/1euro/
+- **MuJoCo Menagerie / Unitree G1** — Google DeepMind, `mujoco_menagerie/unitree_g1`.
+- **Inspire hand description** — `unitreerobotics/unitree_ros`,
+  `robots/g1_description/inspire_hand` (DFQ).
+- **Damped-least-squares IK** — Buss & Kim, "Selectively Damped Least Squares for
+  Inverse Kinematics", 2005; Nakamura & Hanafusa, singularity-robust inverse, 1986.
+- **Egocentric full-body limitation** — context for body-from-head-cam difficulty,
+  e.g. Tome et al., "xR-EgoPose", ICCV 2019 (egocentric pose is occluded/hard).
+- **Imitation-learning targets** — LeRobot (Hugging Face) dataset format; diffusion
+  policy (Chi et al., 2023); dexterous retargeting (AnyTeleop, Qin et al., 2023).
+- Project docs: `docs/diagnostics.md`, `docs/inspire_hand_model.md`,
+  `docs/live_architecture.md`.
