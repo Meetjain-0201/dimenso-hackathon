@@ -24,10 +24,16 @@ import numpy as np
 PLANE_HEIGHT = 0.75      # table-plane height z (m) the hands nominally work over
 Z_FROM_SCALE = 0.18      # how much apparent hand scale lifts the target above plane
 X_NEAR, X_FAR = 0.18, 0.55   # forward reach mapped from image-v (near..far)
-Y_SPAN = 0.45            # total lateral span mapped from image-u
-SIDE_BIAS = 0.10         # push each wrist toward its own side (m) to avoid crossing
+Y_SPAN = 0.45            # lateral span mapped from image-u (sets the lateral CENTER)
 SCALE_REF = 0.22         # reference hand bbox size (norm units) ≈ "comfortable" depth
 SCALE_GAIN = 0.20        # forward (x) shift per unit (scale-SCALE_REF)
+# CHANGE 3: lateral hand SEPARATION now tracks the REAL detected wrists (was a
+# fixed SIDE_BIAS that ignored the human). When both hands are seen, the robot's
+# two wrist targets are placed symmetrically about their image midpoint with a
+# separation derived from the actual normalized image wrist-spacing.
+SEP_GAIN = 1.0           # robot lateral separation (m) per unit normalized image wrist-sep
+SEP_MIN, SEP_MAX = 0.05, 0.50   # clamp robot hand separation to a reachable range
+Y_MAX = 0.32             # |y| clamp per wrist (lateral workspace reach)
 
 
 def _hand_scale(landmarks):
@@ -49,8 +55,10 @@ def wrist_to_target(side, wrist_uv, landmarks, mp_z=None):
     u, v = float(wrist_uv[0]), float(wrist_uv[1])
     scale = _hand_scale(landmarks)
 
-    # lateral: image-left → +y (robot left). u in [0,1] → y in [+Y/2 .. -Y/2]
-    y = (0.5 - u) * Y_SPAN
+    # lateral: image-left → +y (robot left). u in [0,1] → y in [+Y/2 .. -Y/2].
+    # (Single-hand fallback; for both-hands frames Y is overwritten in
+    # stabilize_targets to track the real wrist separation — see CHANGE 3.)
+    y = float(np.clip((0.5 - u) * Y_SPAN, -Y_MAX, Y_MAX))
     # forward: top of image = far. v in [0,1] (top..bottom) → x in [X_FAR..X_NEAR]
     x = X_FAR + (X_NEAR - X_FAR) * v
     # scale refinement: a bigger hand reads as closer → pull forward target in
@@ -62,8 +70,6 @@ def wrist_to_target(side, wrist_uv, landmarks, mp_z=None):
     # weak mp relative-z prior: more negative z (closer to cam) → slightly nearer
     if mp_z is not None and not np.isnan(mp_z):
         x += float(np.clip(mp_z, -0.2, 0.2)) * 0.1
-    # keep each wrist on its own side
-    y += SIDE_BIAS if side == "left" else -SIDE_BIAS
     return np.array([x, y, z])
 
 
@@ -79,6 +85,19 @@ def stabilize_targets(pose):
                 mpz = d["landmarks"][fi, 0, 2]
                 tg[fi] = wrist_to_target(side, d["wrist_uv"][fi], d["landmarks"][fi], mpz)
         out[side] = tg
+
+    # CHANGE 3: when BOTH hands are detected, override the lateral Y so the robot's
+    # hand separation tracks the human's actual wrist spacing (X/Z unchanged).
+    luv, ruv = pose["left"]["wrist_uv"], pose["right"]["wrist_uv"]
+    both = pose["left"]["present"] & pose["right"]["present"]
+    for fi in range(T):
+        if not both[fi] or np.any(np.isnan(luv[fi])) or np.any(np.isnan(ruv[fi])):
+            continue
+        uL, uR = float(luv[fi, 0]), float(ruv[fi, 0])
+        robot_sep = float(np.clip(abs(uL - uR) * SEP_GAIN, SEP_MIN, SEP_MAX))
+        y_center = (0.5 - 0.5 * (uL + uR)) * Y_SPAN            # midpoint → lateral center
+        out["left"][fi, 1] = np.clip(y_center + robot_sep / 2, -Y_MAX, Y_MAX)
+        out["right"][fi, 1] = np.clip(y_center - robot_sep / 2, -Y_MAX, Y_MAX)
     return out
 
 
