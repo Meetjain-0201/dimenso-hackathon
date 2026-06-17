@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.ipynb_checkpoints/
+
+# Large-file / data guards — never commit recordings or generated artifacts
+mentra-pull/
+data/
+outputs/
+*.mp4
+*.npz
