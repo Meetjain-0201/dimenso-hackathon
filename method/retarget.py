@@ -33,7 +33,12 @@ PINCH_REF = 0.12         # pinch (norm units) below which thumb fully opposes
 
 _ARM_J = ["shoulder_pitch", "shoulder_roll", "shoulder_yaw", "elbow",
           "wrist_roll", "wrist_pitch", "wrist_yaw"]
-_WAIST_J = ["waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint"]
+# CHANGE 2: torso stays UPRIGHT. Only waist_yaw is driven (by head-IMU yaw, so the
+# robot turns to face where the person looked); waist_roll & waist_pitch are
+# intentionally LOCKED to 0 — no leaning. (This also fixes a prior axis-mismap
+# where the lean vector [roll,pitch,yaw] was paired against [yaw,roll,pitch].)
+_WAIST_YAW = "waist_yaw_joint"
+_WAIST_LOCKED = ["waist_roll_joint", "waist_pitch_joint"]
 # STOW = arm hangs straight DOWN (idle), out of the downward POV frame.
 # elbow≈π/2 folds the forearm from the rest L-shape down to parallel with the
 # (downward) upper arm → whole arm vertical. (Was elbow=0 → forearm forward,
@@ -53,7 +58,8 @@ class Retargeter:
         self.jrange = lambda n: m.jnt_range[jid(n)]
 
         self.arm_j = {s: [f"{s}_{j}_joint" for j in _ARM_J] for s in ("left", "right")}
-        self.waist_j = list(_WAIST_J)
+        self.waist_j = [_WAIST_YAW]               # only yaw is a controlled waist DoF
+        self.waist_locked = list(_WAIST_LOCKED)   # roll & pitch forced to 0 (upright)
         self.hand_body = {s: mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY,
                           f"{'L' if s == 'left' else 'R'}_hand_base_link") for s in ("left", "right")}
         # finger joints grouped by side, by mediapipe finger
@@ -95,14 +101,14 @@ class Retargeter:
                 q[self.qadr(j)] = lo          # lower limit = relaxed open
 
     # ── DLS IK over waist + present arms ──────────────────────────────────────
-    def _ik(self, q, active, targets, lean):
+    def _ik(self, q, active, targets, yaw_target):
         m, d = self.m, self.d
-        dofs = [self.dadr(j) for j in self.waist_j]
+        dofs = [self.dadr(j) for j in self.waist_j]      # [waist_yaw] only
         for s in active:
             dofs += [self.dadr(j) for j in self.arm_j[s]]
         dofs = np.array(dofs)
-        waist_dofs = [self.dadr(j) for j in self.waist_j]
-        waist_q_idx = [self.qadr(j) for j in self.waist_j]
+        yaw_dof = self.dadr(_WAIST_YAW)
+        yaw_q = self.qadr(_WAIST_YAW)
         jacp = np.zeros((3, m.nv))
         for _ in range(IK_ITERS):
             d.qpos[:] = q
@@ -112,12 +118,11 @@ class Retargeter:
                 mujoco.mj_jacBody(m, d, jacp, None, self.hand_body[s])
                 rows_J.append(jacp[:, dofs])
                 rows_e.append(targets[s] - d.xpos[self.hand_body[s]])
-            # soft waist→lean bias rows (selector on waist dofs)
-            sel = np.zeros((3, len(dofs)))
-            for r, wd in enumerate(waist_dofs):
-                sel[r, list(dofs).index(wd)] = WAIST_BIAS_W
+            # soft waist_yaw→head-yaw bias (single row; roll/pitch are locked, not solved)
+            sel = np.zeros((1, len(dofs)))
+            sel[0, list(dofs).index(yaw_dof)] = WAIST_BIAS_W
             rows_J.append(sel)
-            rows_e.append(WAIST_BIAS_W * (lean - q[waist_q_idx]))
+            rows_e.append(np.array([WAIST_BIAS_W * (yaw_target - q[yaw_q])]))
             J = np.vstack(rows_J); e = np.concatenate(rows_e)
             JJt = J @ J.T + (DLS_LAMBDA ** 2) * np.eye(J.shape[0])
             dq = J.T @ np.linalg.solve(JJt, e)
@@ -151,12 +156,16 @@ class Retargeter:
         q_des = self.q.copy()                      # warm start; legs/base stay frozen
         active = [s for s in ("left", "right") if present[s] and np.all(np.isfinite(targets[s]))]
 
+        yaw_target = float(lean[2])                # lean = [roll, pitch, yaw]; use yaw only
         if active:
-            q_des = self._ik(q_des, active, targets, lean)
+            q_des = self._ik(q_des, active, targets, yaw_target)
         else:
-            # no arms: still lean the waist toward the IMU target
-            for r, j in enumerate(self.waist_j):
-                lo, hi = self.jrange(j); q_des[self.qadr(j)] = np.clip(lean[r], lo, hi)
+            # no arms: still turn the waist toward the head-yaw target
+            lo, hi = self.jrange(_WAIST_YAW)
+            q_des[self.qadr(_WAIST_YAW)] = np.clip(yaw_target, lo, hi)
+        # CHANGE 2: keep the torso vertical — lock roll & pitch to 0 (no leaning)
+        for j in self.waist_locked:
+            q_des[self.qadr(j)] = 0.0
 
         # per-arm: commit IK result / hold-last-valid / ease to stow
         for s in ("left", "right"):
@@ -186,6 +195,8 @@ class Retargeter:
         limit(self.waist_j + self.arm_j["left"] + self.arm_j["right"], RATE_ARM)
         for s in ("left", "right"):
             limit(sum(self.finger_j[s].values(), []), RATE_FINGER)
+        for j in self.waist_locked:               # keep torso upright after limiting too
+            q_new[self.qadr(j)] = 0.0
         self.q = q_new
         return q_new.copy()
 
