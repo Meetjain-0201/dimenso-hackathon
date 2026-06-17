@@ -11,9 +11,9 @@ G1+Inspire qpos target:
     task row), so torso lean and arm reach cooperate rather than fight.
   * Fingers: per-finger curl → Inspire finger joint angles (independent joints,
     no 6→12 coupling, matching the model). Thumb opposition from pinch.
-  * STOW per arm when its hand isn't present: upper arm down, forearm forward
-    (elbow≈0 → ~90° L), wrists 0, fingers relaxed open. A hold-last-valid window
-    bridges brief dropouts before easing to stow.
+  * STOW per arm when its hand isn't present: arm hangs straight DOWN (upper arm
+    down, forearm down, out of the POV frame), wrists 0, fingers relaxed open. A
+    hold-last-valid window bridges brief dropouts before easing to stow.
   * Safety: per-joint rate limiting so motion eases (esp. on dropout/stow).
 
 Names/indices are all read from the model — nothing hardcoded.
@@ -34,8 +34,12 @@ PINCH_REF = 0.12         # pinch (norm units) below which thumb fully opposes
 _ARM_J = ["shoulder_pitch", "shoulder_roll", "shoulder_yaw", "elbow",
           "wrist_roll", "wrist_pitch", "wrist_yaw"]
 _WAIST_J = ["waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint"]
+# STOW = arm hangs straight DOWN (idle), out of the downward POV frame.
+# elbow≈π/2 folds the forearm from the rest L-shape down to parallel with the
+# (downward) upper arm → whole arm vertical. (Was elbow=0 → forearm forward,
+# which sat in the POV frame and misled diagnosis.)
 STOW = {"shoulder_pitch": 0.0, "shoulder_roll": 0.0, "shoulder_yaw": 0.0,
-        "elbow": 0.0, "wrist_roll": 0.0, "wrist_pitch": 0.0, "wrist_yaw": 0.0}
+        "elbow": 1.5708, "wrist_roll": 0.0, "wrist_pitch": 0.0, "wrist_yaw": 0.0}
 
 
 class Retargeter:
