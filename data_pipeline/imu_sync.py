@@ -82,8 +82,13 @@ def imu_to_waist(imu_path, frame_times):
         np.clip(pitch, -rp, rp),
         np.clip(yaw, -yc, yc),
     ])
-    return lean, dict(n_imu=len(s), imu_dur=float(t_imu[-1]), video_dur=float(ft[-1]),
-                      mean_dt_ms=float(np.mean(np.diff(t_imu)) * 1000))
+    # `lean` (the IK input) is unchanged. The meta dict additionally exposes the
+    # per-frame resampled IMU + recovered orientation for the dataset/figures.
+    meta = dict(n_imu=len(s), imu_dur=float(t_imu[-1]), video_dur=float(ft[-1]),
+                mean_dt_ms=float(np.mean(np.diff(t_imu)) * 1000),
+                accel=acc_f, gyro=gyr_f,                 # (T,3) resampled to frame times
+                head_roll=roll, head_pitch=pitch, head_yaw=yaw)  # (T,) relative, unclamped
+    return lean, meta
 
 
 def main():
